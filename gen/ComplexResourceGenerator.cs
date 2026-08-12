@@ -20,8 +20,6 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
 {
     private const string ServiceAttribute = "ComplexResources.GenerateComplexServiceAttribute";
     private const string SubResourceAttribute = "ComplexResources.SubResourceAttribute";
-    private const string MergeableInterface = "IMergeable";
-    private const string MergeableNamespace = "ComplexResources";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
@@ -78,7 +76,8 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
         {
             diagnostics.Add(DiagnosticInfo.Create("CR0001", location, resource.Name));
             return new ServiceSpec(typeName ?? "Complex", "", false, EquatableArray<SubResourceRef>.Empty,
-                EquatableArray<MethodModel>.Empty, EquatableArray<DiagnosticInfo>.From(diagnostics));
+                EquatableArray<MergeHandlerRef>.Empty, EquatableArray<MethodModel>.Empty,
+                EquatableArray<DiagnosticInfo>.From(diagnostics));
         }
 
         typeName ??= DefaultName(contractDef.Name);
@@ -95,14 +94,43 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
             SubServiceTypeFqn: Fqn(contractDef.Construct(s.Type)))).ToList();
 
         var methods = BuildMethods(contractDef, resource, location, diagnostics, ct);
+        var mergeHandlers = BuildMergeHandlers(methods, subs);
 
         return new ServiceSpec(
             typeName,
             Fqn(contractDef.Construct(resource)),
             constructorIsPrivate,
             EquatableArray<SubResourceRef>.From(subs),
+            EquatableArray<MergeHandlerRef>.From(mergeHandlers),
             EquatableArray<MethodModel>.From(methods),
             EquatableArray<DiagnosticInfo>.From(diagnostics));
+    }
+
+    // One injected IMergeHandler<T> per distinct result type across the service's result methods.
+    private static List<MergeHandlerRef> BuildMergeHandlers(List<MethodModel> methods, List<SubResourceRef> subs)
+    {
+        var handlers = new List<MergeHandlerRef>();
+        var byType = new HashSet<string>();
+        var usedFields = new HashSet<string>(subs.Select(s => s.FieldName));
+
+        foreach (var method in methods)
+        {
+            if (!method.HasResult || !byType.Add(method.ResultTypeFqn!)) continue;
+
+            var baseName = "merge" + SimpleName(method.ResultTypeFqn!);
+            var param = baseName;
+            for (var i = 2; !usedFields.Add("_" + param); i++) param = baseName + i;
+            handlers.Add(new MergeHandlerRef(method.ResultTypeFqn!, param, "_" + param));
+        }
+
+        return handlers;
+    }
+
+    private static string SimpleName(string fqn)
+    {
+        var head = fqn.IndexOf('<') is var lt && lt >= 0 ? fqn.Substring(0, lt) : fqn;
+        var dot = head.LastIndexOf('.');
+        return dot < 0 ? head.Replace("global::", "") : head.Substring(dot + 1);
     }
 
     private static List<MethodModel> BuildMethods(
@@ -148,12 +176,6 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
             {
                 diagnostics.Add(DiagnosticInfo.Create("CR0003", location, def.Name,
                     $"unsupported return type '{closedMethod.ReturnType.ToDisplayString()}' (expected Task/ValueTask, optionally of a result)"));
-                continue;
-            }
-
-            if (result is not null && !IsMergeable(result))
-            {
-                diagnostics.Add(DiagnosticInfo.Create("CR0004", location, result.ToDisplayString(), closedMethod.Name));
                 continue;
             }
 
@@ -217,13 +239,6 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
         };
     }
 
-    private static bool IsMergeable(ITypeSymbol result)
-        => result.AllInterfaces.Any(i =>
-            i.OriginalDefinition.Name == MergeableInterface &&
-            i.OriginalDefinition.ContainingNamespace?.ToDisplayString() == MergeableNamespace &&
-            i.TypeArguments.Length == 1 &&
-            SymbolEqualityComparer.Default.Equals(i.TypeArguments[0], result));
-
     private static int ResourceParameterIndex(ImmutableArray<IParameterSymbol> parameters, ITypeParameterSymbol typeParam)
     {
         for (var i = 0; i < parameters.Length; i++)
@@ -272,8 +287,8 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
             foreach (var info in service.Diagnostics)
             {
                 var diagnostic = info.ToDiagnostic();
-                // CR0001 (bad contract) blocks the whole service; per-method CR0003/CR0004 only skip
-                // that method (already excluded) so the rest can still generate.
+                // CR0001 (bad contract) blocks the whole service; per-method CR0003 only skips that
+                // method (already excluded) so the rest can still generate.
                 if (diagnostic.Id == "CR0001") blocked = true;
                 spc.ReportDiagnostic(diagnostic);
             }
@@ -304,25 +319,33 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
         sb.AppendLine($"{indent}public sealed partial class {service.TypeName} : {service.ContractClosedFqn}");
         sb.AppendLine($"{indent}{{");
 
-        foreach (var sub in subs)
-            sb.AppendLine($"{indent}    private readonly {sub.SubServiceTypeFqn} {sub.FieldName};");
+        // Constructor dependencies: one sub-service per sub-resource, then one IMergeHandler per
+        // distinct result type.
+        var deps = subs.Select(s => (Type: s.SubServiceTypeFqn, s.ParameterName, s.FieldName))
+            .Concat(service.MergeHandlers.Array.Select(h =>
+                (Type: $"global::ComplexResources.IMergeHandler<{h.ResultTypeFqn}>", h.ParameterName, h.FieldName)))
+            .ToList();
+
+        foreach (var dep in deps)
+            sb.AppendLine($"{indent}    private readonly {dep.Type} {dep.FieldName};");
         sb.AppendLine();
 
         // Private when the author declares their own constructor, so they can chain: `: this(...)`
         // and add extra dependencies; public otherwise so it is the injectable constructor.
         var access = service.ConstructorIsPrivate ? "private" : "public";
         sb.AppendLine($"{indent}    {access} {service.TypeName}(");
-        for (var i = 0; i < subs.Length; i++)
-            sb.AppendLine($"{indent}        {subs[i].SubServiceTypeFqn} {subs[i].ParameterName}{(i == subs.Length - 1 ? ")" : ",")}");
+        for (var i = 0; i < deps.Count; i++)
+            sb.AppendLine($"{indent}        {deps[i].Type} {deps[i].ParameterName}{(i == deps.Count - 1 ? ")" : ",")}");
         sb.AppendLine($"{indent}    {{");
-        foreach (var sub in subs)
-            sb.AppendLine($"{indent}        {sub.FieldName} = {sub.ParameterName};");
+        foreach (var dep in deps)
+            sb.AppendLine($"{indent}        {dep.FieldName} = {dep.ParameterName};");
         sb.AppendLine($"{indent}    }}");
 
+        var mergeField = service.MergeHandlers.Array.ToDictionary(h => h.ResultTypeFqn, h => h.FieldName);
         foreach (var method in service.Methods.Array)
         {
             sb.AppendLine();
-            RenderMethod(sb, indent, subs, method);
+            RenderMethod(sb, indent, subs, method, mergeField);
         }
 
         sb.AppendLine($"{indent}}}");
@@ -332,7 +355,9 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
         return sb.ToString();
     }
 
-    private static void RenderMethod(StringBuilder sb, string indent, ImmutableArray<SubResourceRef> subs, MethodModel method)
+    private static void RenderMethod(
+        StringBuilder sb, string indent, ImmutableArray<SubResourceRef> subs, MethodModel method,
+        Dictionary<string, string> mergeField)
     {
         var parameters = method.Parameters.Array;
         var paramList = string.Join(", ", parameters.Select(p => $"{p.TypeFqn} {p.Name}"));
@@ -353,7 +378,7 @@ public sealed class ComplexResourceGenerator : IIncrementalGenerator
         if (method.HasResult)
         {
             sb.AppendLine($"{indent}        var __results = await {whenAll}.ConfigureAwait(false);");
-            sb.AppendLine($"{indent}        return {method.ResultTypeFqn}.Merge(__results);");
+            sb.AppendLine($"{indent}        return {mergeField[method.ResultTypeFqn!]}.Merge(__results);");
         }
         else
         {

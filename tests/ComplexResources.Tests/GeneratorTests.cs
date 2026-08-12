@@ -4,9 +4,9 @@ namespace ComplexResources.Tests;
 
 public class GeneratorTests
 {
-    // Shared contracts + resource. User carries [ComplexResource]/[SubResource] but no
-    // [GenerateComplexService] — each test adds those on its own partial declaration, so diagnostic
-    // tests stay clean. State provides the merge via IMergeable<State>.
+    // Shared contracts + resource. State is a plain type we don't control — its merge is supplied as
+    // an injected IMergeHandler<State>, never on the type. User carries [ComplexResource]/[SubResource]
+    // but no [GenerateComplexService]; each test adds those on its own partial declaration.
     private const string Preamble = """
         using System;
         using System.Collections.Generic;
@@ -17,11 +17,7 @@ public class GeneratorTests
 
         namespace Sample
         {
-            public sealed record State(IReadOnlyCollection<string> Flags) : IMergeable<State>
-            {
-                public static State Merge(IReadOnlyList<State> parts)
-                    => new(parts.SelectMany(p => p.Flags).Distinct().ToArray());
-            }
+            public sealed record State(IReadOnlyCollection<string> Flags);
 
             public readonly record struct LocalUser(string Id);
             public readonly record struct RemoteUser(string Id);
@@ -44,6 +40,27 @@ public class GeneratorTests
         }
         """;
 
+    // Fakes + a State merge handler, for the behavioral (emit-and-run) tests.
+    private const string ReaderFakes = """
+        namespace Sample
+        {
+            public sealed class FakeLocal : IStateReader<LocalUser>
+            {
+                public ValueTask<State> GetStateAsync(LocalUser r, CancellationToken c) => new(new State(new[] { "local" }));
+            }
+
+            public sealed class FakeRemote : IStateReader<RemoteUser>
+            {
+                public ValueTask<State> GetStateAsync(RemoteUser r, CancellationToken c) => new(new State(new[] { "remote" }));
+            }
+
+            public sealed class StateMerge : IMergeHandler<State>
+            {
+                public State Merge(IReadOnlyList<State> parts) => new(parts.SelectMany(p => p.Flags).Distinct().ToArray());
+            }
+        }
+        """;
+
     private static string Source(string body) => Preamble + "\n" + body;
 
     private const string ReaderOnUser = """
@@ -55,18 +72,17 @@ public class GeneratorTests
         """;
 
     [Fact]
-    public void Generates_from_the_resource_with_inlined_merge()
+    public void Generates_from_the_resource_and_injects_a_merge_handler()
     {
         var run = GeneratorHarness.Run(Source(ReaderOnUser));
 
         Assert.Empty(run.CompileErrors);
         var generated = run.SingleGenerated();
         Assert.Contains("public sealed partial class ComplexStateReader : global::Sample.IStateReader<global::Sample.User>", generated);
-        Assert.Contains("public ComplexStateReader(", generated); // injectable by default
+        // The merge handler is a constructor dependency, not a method or a call on the result type.
+        Assert.Contains("global::ComplexResources.IMergeHandler<global::Sample.State> mergeState", generated);
         Assert.Contains("_local.GetStateAsync(resource.Local, cancel).AsTask()", generated);
-        // Merge is inlined as a call to the result type — no partial method.
-        Assert.Contains("return global::Sample.State.Merge(__results);", generated);
-        Assert.DoesNotContain("partial", generated.Replace("partial class", "")); // no leftover partial merge decls
+        Assert.Contains("return _mergeState.Merge(__results);", generated);
     }
 
     [Fact]
@@ -85,10 +101,11 @@ public class GeneratorTests
         Assert.Empty(run.CompileErrors);
         var generated = run.SingleGenerated();
         Assert.Contains("_local.UpdateAsync(resource.Local, state, cancel).AsTask()", generated);
-        Assert.Contains("return global::Sample.State.Merge(__results);", generated);
-        // The void RevokeAsync fans out but merges nothing.
+        Assert.Contains("return _mergeState.Merge(__results);", generated);
         Assert.Contains("_local.RevokeAsync(resource.Local, cancel).AsTask()", generated);
-        Assert.Equal(1, CountOccurrences(generated, ".Merge(__results)")); // only UpdateAsync merges
+        // One handler injected (State used once), and only UpdateAsync merges.
+        Assert.Equal(1, CountOccurrences(generated, "IMergeHandler<global::Sample.State> mergeState"));
+        Assert.Equal(1, CountOccurrences(generated, ".Merge(__results)"));
     }
 
     [Fact]
@@ -112,43 +129,28 @@ public class GeneratorTests
     }
 
     [Fact]
-    public void Fan_out_and_merge_actually_run()
+    public void Fan_out_and_injected_merge_actually_run()
     {
         var probe = """
             namespace Sample
             {
-                public sealed class FakeLocal : IStateReader<LocalUser>
-                {
-                    public ValueTask<State> GetStateAsync(LocalUser r, CancellationToken c)
-                        => new(new State(new[] { "local" }));
-                }
-
-                public sealed class FakeRemote : IStateReader<RemoteUser>
-                {
-                    public ValueTask<State> GetStateAsync(RemoteUser r, CancellationToken c)
-                        => new(new State(new[] { "remote" }));
-                }
-
                 public static class Probe
                 {
                     public static string[] Run()
                     {
-                        var service = new ComplexStateReader(new FakeLocal(), new FakeRemote());
-                        var state = service
+                        var service = new ComplexStateReader(new FakeLocal(), new FakeRemote(), new StateMerge());
+                        return service
                             .GetStateAsync(new User(new LocalUser("l"), new RemoteUser("r")), default)
-                            .GetAwaiter().GetResult();
-                        return state.Flags.ToArray();
+                            .GetAwaiter().GetResult().Flags.ToArray();
                     }
                 }
             }
             """;
 
-        var run = GeneratorHarness.Run(Source(ReaderOnUser + "\n" + probe));
+        var run = GeneratorHarness.Run(Source(ReaderOnUser + "\n" + ReaderFakes + "\n" + probe));
         var assembly = GeneratorHarness.EmitAndLoad(run);
 
-        var result = (string[])assembly.GetType("Sample.Probe")!
-            .GetMethod("Run")!
-            .Invoke(null, null)!;
+        var result = (string[])assembly.GetType("Sample.Probe")!.GetMethod("Run")!.Invoke(null, null)!;
 
         Assert.Equal(new[] { "local", "remote" }, result);
     }
@@ -156,7 +158,8 @@ public class GeneratorTests
     [Fact]
     public void Author_constructor_makes_generated_constructor_private_and_chainable()
     {
-        // The author declares extra dependencies and chains to the generated constructor.
+        // The author declares an extra dependency and chains to the generated constructor, passing the
+        // sub-services and the merge handler through.
         var body = """
             namespace Sample
             {
@@ -170,29 +173,19 @@ public class GeneratorTests
                 {
                     private readonly IClock _clock;
                     public ComplexStateReader(
-                        IStateReader<LocalUser> local, IStateReader<RemoteUser> remote, IClock clock)
-                        : this(local, remote)
+                        IStateReader<LocalUser> local, IStateReader<RemoteUser> remote,
+                        IMergeHandler<State> mergeState, IClock clock)
+                        : this(local, remote, mergeState)
                     {
                         _clock = clock;
                     }
-                }
-
-                public sealed class FakeLocal : IStateReader<LocalUser>
-                {
-                    public ValueTask<State> GetStateAsync(LocalUser r, CancellationToken c) => new(new State(new[] { "local" }));
-                }
-
-                public sealed class FakeRemote : IStateReader<RemoteUser>
-                {
-                    public ValueTask<State> GetStateAsync(RemoteUser r, CancellationToken c) => new(new State(new[] { "remote" }));
                 }
 
                 public static class Probe
                 {
                     public static string[] Run()
                     {
-                        // Constructed via the author's constructor with the extra dependency.
-                        var service = new ComplexStateReader(new FakeLocal(), new FakeRemote(), new SystemClock());
+                        var service = new ComplexStateReader(new FakeLocal(), new FakeRemote(), new StateMerge(), new SystemClock());
                         return service
                             .GetStateAsync(new User(new LocalUser("l"), new RemoteUser("r")), default)
                             .GetAwaiter().GetResult().Flags.ToArray();
@@ -201,11 +194,10 @@ public class GeneratorTests
             }
             """;
 
-        var run = GeneratorHarness.Run(Source(body));
+        var run = GeneratorHarness.Run(Source(body + "\n" + ReaderFakes));
 
         Assert.Empty(run.CompileErrors);
         Assert.Contains("private ComplexStateReader(", run.SingleGenerated());
-        Assert.DoesNotContain("public ComplexStateReader(", run.SingleGenerated());
 
         var assembly = GeneratorHarness.EmitAndLoad(run);
         var result = (string[])assembly.GetType("Sample.Probe")!.GetMethod("Run")!.Invoke(null, null)!;
@@ -283,30 +275,6 @@ public class GeneratorTests
         var run = GeneratorHarness.Run(Source(body));
 
         Assert.True(run.HasError("CR0003"));
-        Assert.Empty(run.GeneratedSources);
-    }
-
-    [Fact]
-    public void CR0004_when_result_type_is_not_mergeable()
-    {
-        var body = """
-            namespace Sample
-            {
-                public sealed record Plain(int N); // does not implement IMergeable<Plain>
-
-                public interface IPlainReader<in T> where T : notnull
-                {
-                    ValueTask<Plain> ReadAsync(T resource, CancellationToken cancel);
-                }
-
-                [GenerateComplexService(typeof(IPlainReader<>))]
-                public readonly partial record struct User;
-            }
-            """;
-
-        var run = GeneratorHarness.Run(Source(body));
-
-        Assert.True(run.HasError("CR0004"));
         Assert.Empty(run.GeneratedSources);
     }
 

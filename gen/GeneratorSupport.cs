@@ -22,10 +22,6 @@ internal static class Diagnostics
         "CR0003", "Unsupported contract method",
         "Contract method '{0}' cannot be forwarded: {1}");
 
-    public static readonly DiagnosticDescriptor NotMergeable = Error(
-        "CR0004", "Result type is not mergeable",
-        "Result type '{0}' of contract method '{1}' must implement IMergeable<{0}> so results can be merged");
-
     private static DiagnosticDescriptor Error(string id, string title, string messageFormat)
         => new(id, title, messageFormat, Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
@@ -33,8 +29,7 @@ internal static class Diagnostics
     {
         "CR0001" => BadContract,
         "CR0002" => NoSubResources,
-        "CR0003" => UnsupportedMethod,
-        _ => NotMergeable,
+        _ => UnsupportedMethod,
     };
 }
 
@@ -53,6 +48,12 @@ internal sealed record SubResourceRef(
     string ParameterName,       // e.g. "local" — constructor parameter
     string FieldName,           // e.g. "_local"
     string SubServiceTypeFqn);  // e.g. global::...IStateWriter<global::...LocalUser>
+
+/// <summary>An injected IMergeHandler for one distinct result type of a service.</summary>
+internal sealed record MergeHandlerRef(
+    string ResultTypeFqn,       // e.g. global::...State
+    string ParameterName,       // e.g. "mergeState"
+    string FieldName);          // e.g. "_mergeState"
 
 internal sealed record ParamModel(string TypeFqn, string Name, bool IsResource);
 
@@ -74,6 +75,7 @@ internal sealed record ServiceSpec(
     string ContractClosedFqn,   // e.g. global::...IStateWriter<global::...User>
     bool ConstructorIsPrivate,  // true when the author declares their own ctor to chain to this one
     EquatableArray<SubResourceRef> Subs,
+    EquatableArray<MergeHandlerRef> MergeHandlers,
     EquatableArray<MethodModel> Methods,
     EquatableArray<DiagnosticInfo> Diagnostics);
 
