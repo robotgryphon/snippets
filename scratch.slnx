@@ -1,6 +1,0 @@
-<Solution>
-  <Project Path="ComplexResources/ComplexResources.csproj" />
-  <Project Path="gen/ComplexResources.Generator.csproj" />
-  <Project Path="resources\Resources.csproj" />
-  <Project Path="tests/ComplexResources.Tests/ComplexResources.Tests.csproj" />
-</Solution>
