@@ -15,12 +15,13 @@ namespace ExternalGraphQL;
 /// the project directory. A resource that merely implements <see cref="IResourceWithEndpoints"/> is
 /// found by the scan and then dropped with "Could not determine project path".
 /// <para>
-/// <see cref="IResourceWithoutLifetime"/> and a <see cref="ExternalProjectMetadata.SuppressBuild"/>
-/// of <see langword="true"/> are what keep the orchestrator from trying to build or launch the
-/// synthetic project directory this resource points at.
+/// Being a <see cref="ProjectResource"/> means the orchestrator will try to build and launch it.
+/// <c>WithExplicitStart()</c> is what actually stops that — see <c>AddExternalGraphQL</c>.
+/// <see cref="IResourceWithoutLifetime"/> does <em>not</em>: it is ignored for a
+/// <see cref="ProjectResource"/> subclass, which is why this type no longer claims it.
 /// </para>
 /// </remarks>
-public sealed class ExternalGraphQLResource : ProjectResource, IResourceWithoutLifetime
+public sealed class ExternalGraphQLResource : ProjectResource
 {
     public ExternalGraphQLResource(string name, ExternalServiceResource service, string projectDirectory)
         : base(name)

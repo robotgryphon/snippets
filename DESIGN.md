@@ -222,13 +222,15 @@ none.
 
 ## Risks
 
-1. **A `ProjectResource` that must not be launched.** Deriving from `ProjectResource` is forced by
-   `GetProjectPath`, but it puts the resource in the category Aspire launches. `SuppressBuild`,
-   `IResourceWithoutLifetime`, and `ExcludeFromManifest()` are the intended defence, and whether DCP
-   honours `IResourceWithoutLifetime` on a `ProjectResource` subclass is **unverified**. This is the
-   first thing to spike: if DCP tries to build or run the synthetic directory, the fallback is a
-   launch-suppressing annotation, or upstreaming a `GetProjectPath` that accepts any resource
-   carrying `IProjectMetadata`.
+1. **A `ProjectResource` that must not be launched.** *Confirmed and handled.* Deriving from
+   `ProjectResource` is forced by `GetProjectPath`, and it does put the resource in the set the
+   orchestrator launches — `IResourceWithoutLifetime` is **not** honoured for a `ProjectResource`
+   subclass, so that marker has been dropped rather than left as decoration. The fix is
+   `WithExplicitStart()`, which keeps the resource in the model where composition finds it but never
+   starts it with the app host, plus `WithHidden()` to keep a permanently NotStarted row out of the
+   dashboard, `SuppressBuild`, and a generated placeholder `.csproj` so nothing that inspects the
+   path finds it missing. The clean long-term fix is still upstream: a `GetProjectPath` that accepts
+   any resource carrying `IProjectMetadata` instead of type-checking `ProjectResource`.
 2. **Subscriber ordering.** Our download must precede Fusion's composition within the same
    `BeforeStartEvent`. Registration order gives us that today; it is a behavioural dependency, not a
    contract, and a dispatch that ever went concurrent would break it silently — the symptom would be
