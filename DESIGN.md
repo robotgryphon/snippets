@@ -1,180 +1,191 @@
-# External GraphQL Subgraphs — teaching Aspire about a HotChocolate service it doesn't own
+# External GraphQL source schemas — making an Aspire `ExternalServiceResource` visible to Fusion
 
 ## Problem
 
-Fusion 16 rebuilt its Aspire story around *projects*. `builder.AddGraphQLOrchestrator()` installs a
-startup hook that discovers subgraph schemas and composes them; each subgraph is an ordinary
-`AddProject<…>()` resource that ships a `schema-settings.json` with an `aspire` environment naming
-its local GraphQL endpoint. `AddFusionGateway` and the explicit `.Compose()` call are gone — the
-gateway is a normal project that loads the composed archive.
-
-That model has no seat for a GraphQL API **we don't build**: a subgraph owned by another team, a
-vendor API, a legacy service that already runs somewhere. In the app model it is an
-`ExternalServiceResource`:
+HotChocolate's Aspire integration already has the discovery mechanism we need. `Fusion.Aspire`
+finds source schemas by scanning the app model for a marker interface plus an annotation:
 
 ```csharp
-var catalog = builder.AddExternalService("catalog", "https://catalog.contoso.com");
-var orders  = builder.AddExternalService("orders", builder.AddParameter("orders-url"));
+// GraphQLResourceBuilderExtensions.cs
+internal static IEnumerable<IResourceWithEndpoints> GetGraphQLSchemaResources(
+    this DistributedApplicationModel appModel)
+    => appModel.Resources.OfType<IResourceWithEndpoints>().Where(r => r.HasGraphQLSchema());
 ```
 
-`ExternalServiceResource` is a sealed `Resource` implementing only `IResourceWithoutLifetime`. It
-carries a `Uri` **or** a `UrlParameter` (never both), no project, no `schema-settings.json`, and no
-compile step we can hook. The orchestrator cannot see it, so it silently composes a gateway that is
-missing those subgraphs.
+`HasGraphQLSchema()` is `Annotations.OfType<GraphQLSourceSchemaAnnotation>().Any()`. Nothing else
+qualifies a resource. So a subgraph is exactly: *an `IResourceWithEndpoints` carrying a
+`GraphQLSourceSchemaAnnotation`*.
 
-We want the external service to become a first-class subgraph without pretending it is a project:
-
-```csharp
-builder.AddGraphQLOrchestrator();
-
-var catalog = builder.AddExternalService("catalog", "https://catalog.contoso.com")
-    .AsGraphQLSubgraph("catalog", sg => sg
-        .WithPath("/graphql")
-        .WithSchemaFile("./schemas/catalog.graphql")
-        .WithHeaderPropagation("Authorization", "traceparent"));
-
-builder.AddProject<Projects.Gateway>("gateway").WithReference(catalog);
-```
-
-## Approach
-
-A **child resource** carrying **annotations**, not annotations sprayed onto the external service.
+Aspire's external service is neither:
 
 ```csharp
-public sealed class GraphQLSubgraphResource(string name, ExternalServiceResource parent)
-    : Resource(name),
-      IResourceWithParent<ExternalServiceResource>,
-      IResourceWithoutLifetime
+// Aspire.Hosting/ExternalServiceResource.cs
+public sealed class ExternalServiceResource : Resource
 {
-    public ExternalServiceResource Parent { get; } = parent;
-    public string SchemaName => this.GetSchemaName();   // annotation-backed
+    public Uri? Uri { get; }                        // null when the URL is parameterized
+    public ParameterResource? UrlParameter { get; } // null when a literal URI was supplied
 }
 ```
 
-`AsGraphQLSubgraph` adds this resource to the app model, parented to the external service, and the
-configuration callback writes annotations onto **it**:
+It does not implement `IResourceWithEndpoints`, and it is `sealed`, so we cannot subclass it into
+compliance. A GraphQL API we don't own is invisible to composition, and Fusion silently produces a
+gateway missing that subgraph.
 
-| Annotation | Cardinality | Carries |
-| --- | --- | --- |
-| `GraphQLSubgraphAnnotation` | replace | schema name as the composed graph sees it |
-| `GraphQLEndpointAnnotation` | append | path + transport (`Http`, `WebSocket`, `ServerSentEvents`) |
-| `GraphQLSchemaSourceAnnotation` | replace | `File`, `Introspection`, `FusionArchive`, or `Registry` |
-| `GraphQLHeaderPropagationAnnotation` | append | header names forwarded gateway → subgraph |
-| `GraphQLClientNameAnnotation` | replace | `HttpClient` name the gateway resolves for this subgraph |
+The fix is a **new resource type that implements `IResourceWithEndpoints` and holds the external
+service as a reference**, then carries the source-schema annotation on itself.
 
-Annotations are the transport, exactly as the rest of Aspire does it — `WithAnnotation<T>(…,
-ResourceAnnotationMutationBehavior.Replace)` for single-valued facts, `Append` for lists. Nothing
-reads state off the builder; every consumer reads the model.
+## The resource
 
-### Why a child resource and not annotations on the external service
+`IResourceWithEndpoints` is an empty marker interface — implementing it is free. All the work is in
+producing an endpoint that satisfies HotChocolate's lookup.
 
-Annotating `ExternalServiceResource` in place is the smaller change, and it was the first sketch. It
-loses on three counts:
+```csharp
+public sealed class ExternalGraphQLResource(string name, ExternalServiceResource service)
+    : Resource(name), IResourceWithEndpoints, IResourceWithoutLifetime
+{
+    public ExternalServiceResource Service { get; } = service;
+}
+```
 
-- **Discovery.** The orchestrator wants `model.Resources.OfType<GraphQLSubgraphResource>()`. The
-  in-place version forces a scan of every resource in the model asking "do you happen to have a
-  GraphQL annotation?" — the same shape as a marker interface, with none of the type safety.
-- **Fan-out.** One host can front more than one schema (`/graphql` and `/admin/graphql`, or a
-  versioned pair). One external service → *n* subgraph children models that directly; annotations on
-  the parent would need every one of them keyed by schema name by hand.
-- **Dashboard.** A child resource nests under its parent and gets its own state, URLs, and health.
-  That is where "catalog subgraph: schema stale" belongs, and an annotation cannot render.
+`IResourceWithoutLifetime` is load-bearing, not decoration: it marks the resource as a holder of data
+rather than something to launch, which is how we expect to keep DCP from trying to allocate or proxy
+the endpoint we are about to synthesize by hand. See *Risks*.
 
-The cost is one extra node in the graph and an `IResourceWithParent` hop when resolving the URL. Both
-are cheap. `WithReference(catalog)` on the gateway keeps working either way — service discovery reads
-the parent, and the child forwards.
+A reference, not `IResourceWithParent`. The external service keeps its own identity and its own
+`WithReference` service-discovery behaviour; this resource is a **projection** of it into Fusion's
+world, and more than one can exist per host (`/graphql` and `/admin/graphql` are two source schemas
+behind one URL). A `ResourceRelationshipAnnotation` of type `Reference` gives the dashboard the link
+without claiming ownership.
 
-### Resolving the URL
+## What HotChocolate actually reads
 
-The one genuinely awkward part. `Uri` is null whenever the resource was built from a parameter, and a
-`ParameterResource` value must be read **asynchronously** (`GetValueAsync`) — Aspire's own
-`WithHealthCheck` for external services has a bug filed for reading it synchronously
-([dotnet/aspire#10468](https://github.com/dotnet/aspire/issues/10468)). So:
+```csharp
+internal static string? GetGraphQLSchemaUrl(this IResourceWithEndpoints resource, string path)
+{
+    var annotation = resource.Annotations.OfType<GraphQLSourceSchemaAnnotation>().FirstOrDefault();
+    if (annotation is not { Location: SourceSchemaLocationType.SchemaEndpoint }) return null;
 
-- `AsGraphQLSubgraph` and the callbacks are pure model-building. They resolve nothing.
-- URL resolution happens once during eventing, in an `InitializeResourceEvent` (or `BeforeStartEvent`)
-  subscriber, and the resolved absolute endpoint is cached back onto the resource as an annotation
-  for later stages to read.
-- Missing parameter value → a diagnostic naming the parameter, not a `NullReferenceException`
-  ([dotnet/aspire#10352](https://github.com/dotnet/aspire/issues/10352)).
+    var endpoint = resource.GetEndpoints().FirstOrDefault(e => e.EndpointName == annotation.EndpointName);
+    if (endpoint?.Url == null) return null;
 
-### Schema acquisition
+    return endpoint.Url.TrimEnd('/') + path;
+}
+```
 
-Composition needs SDL. Four sources, in the order we expect them to be used:
+`GetAllocatedHttpEndpointUrl` additionally requires `endpoint is { IsAllocated: true }`. So the
+contract we must satisfy is precisely: **an `EndpointAnnotation` whose name matches the annotation's
+`EndpointName` (default `"http"`), with `AllocatedEndpoint` set.**
 
-1. **`WithSchemaFile(path)`** — a checked-in `.graphql`. Deterministic, offline, reviewable in a PR;
-   goes stale silently. The default recommendation, and the only one M1 ships.
-2. **`WithIntrospection()`** — fetch at startup. Always current; needs the service reachable and
-   introspection enabled, which production subgraphs often disable.
-3. **`WithFusionArchive(path)`** — a pre-composed `.far` fragment, for a subgraph published by
-   another team's pipeline.
-4. **`WithSchemaRegistry(...)`** — pull by schema name + tag. Deferred; it is the right answer for a
-   real deployment and the wrong first milestone.
+## Attaching the annotation
 
-Whichever source is used, the resolved SDL lands in a well-known per-subgraph location the
-orchestrator's discovery step reads, alongside a synthesized `schema-settings.json`-shaped fragment
-whose `aspire` environment points at the resolved external URL. **This is the interface we are least
-sure of** — see *Verify first*.
+`GraphQLSourceSchemaAnnotation` is `internal` with `InternalsVisibleTo` only for HotChocolate's own
+tests — but we never need to name it. The method that creates it is public and generic over exactly
+the interface we now implement:
 
-### Readiness, without `WaitFor`
+```csharp
+[AspireExport]
+public static IResourceBuilder<T> WithGraphQLHttpEndpoint<T>(
+    this IResourceBuilder<T> builder,
+    string path = "/graphql",
+    string? schemaPath = "/graphql/schema.graphql",
+    string endpointName = "http",
+    string? sourceSchemaName = null)
+    where T : IResourceWithEndpoints
+```
 
-Aspire cannot `WaitFor` an external service ([dotnet/aspire#10827](https://github.com/dotnet/aspire/issues/10827)),
-and `WithHttpProbe` / `WithHttpHealthCheck` don't apply because `ExternalServiceResource` doesn't
-implement `IResourceWithEndpoints` ([microsoft/aspire#11428](https://github.com/microsoft/aspire/issues/11428),
-[#12115](https://github.com/microsoft/aspire/issues/12115)). Under introspection, composition would
-race a service that isn't up.
+Verified present in the shipped `HotChocolate.Fusion.Aspire` **16.6.1** for `net9.0`, `net10.0` and
+`net11.0`. The generic constraint is the entire contract, and satisfying it is the whole point of the
+new resource type — so the intended call site is:
 
-The subgraph resource brings its own gate: a GraphQL-aware probe that `POST`s `{ __typename }` to the
-resolved endpoint and requires a `200` with no `errors`. A `GET /` on a GraphQL host proves nothing —
-it commonly 404s while the schema is perfectly healthy. The probe registers as a real health check on
-the child resource, so the dashboard shows it, and the composition step awaits it with bounded retry
-before reading the schema. File-sourced schemas skip the gate entirely and compose offline.
+```csharp
+var catalog = builder.AddExternalService("catalog", "https://catalog.contoso.com");
 
-## Layout
+builder.AddExternalGraphQL("catalog-graphql", catalog)
+       .WithGraphQLHttpEndpoint(path: "/graphql", schemaPath: "/graphql/schema.graphql");
 
-- `AspireHotChocolate/` — annotations, `GraphQLSubgraphResource`, the builder extensions. AppHost-side
-  only; references `Aspire.Hosting`, no HotChocolate runtime dependency.
-- `AspireHotChocolate.Composition/` — schema acquisition, the probe, and the orchestrator hand-off.
-  Split out because it is the piece most likely to churn against Fusion versions.
-- `samples/` — an AppHost with one external subgraph and one project subgraph behind a gateway,
-  which is also the only honest integration test.
+builder.AddProject<Projects.Gateway>("gateway").WithNitroComposition();
+```
+
+Nothing here is reflection, and nothing depends on an internal type. `WithGraphQLSchemaFile` and
+`WithGraphQLSchemaEndpoint` are also public but both carry `[Obsolete]` — file-based source schemas
+are being retired in favour of fetching from the endpoint.
+
+**Reflection fallback.** Only needed on a version predating `WithGraphQLHttpEndpoint`, or to set a
+field the public method does not expose (there is none today — it covers all five annotation
+properties). If it ever is: resolve the type by name from the `HotChocolate.Fusion.Aspire` assembly,
+construct via `Activator.CreateInstance` with an object initializer through property setters (all
+`init`), and add with `builder.WithAnnotation(...)` typed as `IResourceAnnotation`. Guard it behind a
+single adapter with a version probe so the supported path is used whenever it exists — this is a
+fragile fallback, not the design.
+
+## Synthesizing the endpoint
+
+```csharp
+var ep = new EndpointAnnotation(
+    protocol: ProtocolType.Tcp,
+    uriScheme: uri.Scheme,
+    name: "http",
+    port: uri.Port,
+    isExternal: true,
+    isProxied: false);
+
+ep.AllocatedEndpoint = new AllocatedEndpoint(ep, uri.Host, uri.Port);
+```
+
+Two consequences fall out of `AllocatedEndpoint`, and both shape the API:
+
+```csharp
+public string UriString => $"{UriScheme}://{Address}:{Port}";
+```
+
+- **No path component exists.** An external service at `https://api.contoso.com/catalog` cannot be
+  represented — `UriString` drops `/catalog`, and HotChocolate then appends its own `path`, yielding
+  `https://api.contoso.com:443/graphql`. Silently wrong. `AddExternalGraphQL` must therefore read
+  `Uri.AbsolutePath` and **prefix it onto the `path` and `schemaPath`** passed to
+  `WithGraphQLHttpEndpoint`, or reject a base path outright. Prefixing automatically is the plan; a
+  caller who also passes a path should get a composed result, not a surprise.
+- **The port is always explicit.** `https://catalog.contoso.com` becomes
+  `https://catalog.contoso.com:443`. Legal, but the `Host` header now carries `:443`, which some
+  vhost routers, CDNs, and certificate setups treat as a different host. Needs a real-service test
+  before we call this done.
+
+## Parameterized URLs
+
+When the external service was built from a `ParameterResource`, `Uri` is `null` and the value must be
+read asynchronously, so the endpoint cannot be allocated while building the model. The
+`EndpointAnnotation` is added eagerly (so the resource always looks well-formed to a scan) and
+`AllocatedEndpoint` is assigned during eventing, before composition runs.
+
+That makes **ordering** the open question: composition must not read the endpoint before we have
+filled it. If our subscriber cannot be guaranteed to run first, `AddExternalGraphQL` should require a
+literal `Uri` in v1 and reject `UrlParameter` with a clear message rather than race.
+
+## Risks
+
+1. **DCP and a hand-allocated endpoint.** The whole design rests on DCP leaving a resource with an
+   `EndpointAnnotation` alone when it has no container, project, or executable to launch.
+   `isProxied: false` plus `IResourceWithoutLifetime` is the intended defence. Unverified — this is
+   the first thing to spike, because if DCP tries to allocate a port, the approach needs rethinking.
+2. **Composition ordering** versus async URL resolution, above.
+3. **`Host` header carrying an explicit default port.**
+4. **Internal-type coupling.** Zero at compile time on the supported path. The coupling that remains
+   is behavioural: we depend on HotChocolate looking up an endpoint *by name* with `IsAllocated`.
 
 ## Milestones
 
-- **M0** — this doc, plus a spike that pins the package versions and answers *Verify first*.
-- **M1** — annotations, resource, extensions, `WithSchemaFile`. A composed gateway that includes an
-  external subgraph from a checked-in SDL.
-- **M2** — URL resolution through `UrlParameter`, the readiness probe, `WithIntrospection()`.
-- **M3** — header propagation and `HttpClient` naming on the gateway side; subscriptions transport.
-- **M4** — publish/deploy manifest behavior; `WithSchemaRegistry`.
+- **M0** — spike risk 1 in a throwaway AppHost: does a hand-allocated endpoint on a lifetime-less
+  resource survive startup, and does composition see it?
+- **M1** — `ExternalGraphQLResource`, `AddExternalGraphQL`, literal-`Uri` only, base-path folding.
+  Success is a composed gateway containing a subgraph that is not a project.
+- **M2** — `UrlParameter` support with resolution ordered ahead of composition.
+- **M3** — dashboard relationship and a GraphQL-aware health probe (`POST { __typename }`; a `GET /`
+  on a GraphQL host proves nothing and commonly 404s).
 
-## Verify first
+## Verified against
 
-Written against Fusion 16's documented Aspire model and Aspire 13's `ExternalServiceResource`, but
-the ChilliCream docs were not reachable while drafting. Confirm against the pinned packages before
-building anything on top:
+- `ChilliCream/graphql-platform` @ `443e680` — `src/HotChocolate/Fusion/src/Fusion.Aspire/`.
+- `HotChocolate.Fusion.Aspire` 16.6.1 (shipped) for the public API assertion.
+- `dotnet/aspire` `main` — `ExternalServiceResource.cs`, `EndpointAnnotation.cs`,
+  `AllocatedEndpoint.cs`, `EndpointReference.cs`, `IResourceWithEndpoints.cs`.
 
-- **Does `AddGraphQLOrchestrator()` expose a discovery extension point?** If it does, M1 is an
-  implementation of that interface and most of `AspireHotChocolate.Composition/` disappears. If it
-  only walks project resources, we emit files it already reads — or drive `fusion compose` ourselves
-  and hand the gateway a `.far`. This single answer decides the shape of M1.
-- The exact `schema-settings.json` schema for the `aspire` environment, and whether a synthesized one
-  is respected for a non-project resource.
-- Whether `AddGraphQLGateway().AddFileSystemConfiguration("./gateway.far")` can be pointed at a
-  composed archive produced at AppHost startup, or expects a build-time artifact.
-- Whether `IResourceWithoutLifetime` children receive `InitializeResourceEvent` — if not, the URL
-  resolution and probe both move to `BeforeStartEvent`.
-
-## Open questions
-
-- **Publish mode.** Under `aspire publish`, the external service is just a URL in the manifest. Does
-  the subgraph child emit anything, or is composition strictly a local-orchestration concern with the
-  deployed gateway getting its archive from CI? Leaning toward the latter.
-- **Schema drift.** A checked-in SDL that no longer matches the live service produces a gateway that
-  composes cleanly and fails at runtime. A dev-time introspect-and-diff warning would catch it; it
-  needs introspection to be enabled, which is the case we already can't rely on.
-- **Naming.** `AsGraphQLSubgraph` follows Aspire's `As*` convention for "project this resource as
-  something else" and reads correctly when it returns a *different* builder. If it ends up returning
-  `IResourceBuilder<ExternalServiceResource>` for chaining, it should be `WithGraphQLSubgraph`.
-- **Fusion version coupling.** The composition hand-off is the only version-sensitive surface. Keeping
-  it in its own assembly means a Fusion 17 shift costs one project, not the annotation model.
+Note `AddGraphQLOrchestrator()` is `[Obsolete]` in favour of `AddNitroComposition()`.
