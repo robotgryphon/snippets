@@ -110,16 +110,16 @@ public static class ExternalGraphQLBuilderExtensions
         // The allocated endpoint carries no path, and Fusion builds URLs as
         // endpoint.Url.TrimEnd('/') + path, so a base path on the external URI would be dropped.
         // Only URL-shaped values get it folded back in.
-        var basePath = builder.Resource.Service.Uri?.AbsolutePath.TrimEnd('/');
+        var basePath = ExternalGraphQLUri.BasePathOf(builder.Resource.Service.Uri);
 
         var annotation = GraphQLSourceSchemaAnnotationFactory.Create(
             location: location,
             sourceSchemaName: sourceSchemaName,
             endpointName: endpointName,
             schemaPath: location is SourceSchemaLocation.SchemaEndpoint
-                ? Prefix(basePath, schemaPath)
+                ? ExternalGraphQLUri.CombinePath(basePath, schemaPath)
                 : schemaPath,
-            graphQLPath: Prefix(basePath, graphQLPath));
+            graphQLPath: ExternalGraphQLUri.CombinePath(basePath, graphQLPath));
 
         builder.Resource.Annotations.Add(annotation);
         return builder;
@@ -156,7 +156,4 @@ public static class ExternalGraphQLBuilderExtensions
 
             """);
     }
-
-    private static string? Prefix(string? basePath, string? path)
-        => string.IsNullOrEmpty(basePath) || path is null ? path : basePath + path;
 }

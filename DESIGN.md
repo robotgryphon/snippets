@@ -96,6 +96,12 @@ A `BeforeStartEvent` subscriber, registered while the model is built, does three
    non-empty `name` in it that agrees with the annotation's `SourceSchemaName`. An existing settings
    file is left alone so hand-authored settings survive.
 
+All three paths go through one helper rather than `new Uri(baseUri, relative)`. RFC 3986 resolves a
+relative reference starting with `/` against the *authority*, so `new Uri("https://api.dev/burgers/",
+"/graphql")` is `https://api.dev/graphql` — the base path vanishes. Every path in this integration is
+meant as a suffix of the external service's URL, so the base path is folded in explicitly, the same
+way for the downloader and for the annotation's `GraphQLPath`.
+
 `BeforeStartEvent` is forced, not chosen. Fusion composes from its own `BeforeStartEvent` subscriber,
 and `WaitForSourceSchemaResourcesReadyAsync` skips anything that is not `SchemaEndpoint` — a file
 source is read straight off disk with no wait. The file must therefore exist before Fusion's handler

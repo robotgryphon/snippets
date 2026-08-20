@@ -62,7 +62,7 @@ internal static class ExternalGraphQLSchemaDownloader
         // asynchronously, and Fusion does not read the endpoint until it composes.
         AllocateEndpoint(resource, endpointName, baseUri);
 
-        var schemaUri = new Uri(baseUri, schemaDownloadPath);
+        var schemaUri = ExternalGraphQLUri.Resolve(baseUri, schemaDownloadPath);
 
         logger.LogInformation(
             "Downloading GraphQL schema for {ResourceName} from {SchemaUri}",
