@@ -5,25 +5,36 @@ namespace ExternalGraphQL;
 
 /// <summary>
 /// Projects an <see cref="ExternalServiceResource"/> into something HotChocolate's Fusion
-/// integration can discover.
+/// integration can discover and read a schema for.
 /// </summary>
 /// <remarks>
-/// Fusion finds source schemas with
-/// <c>appModel.Resources.OfType&lt;IResourceWithEndpoints&gt;().Where(r =&gt; r.HasGraphQLSchema())</c>.
-/// <see cref="ExternalServiceResource"/> implements neither that interface nor allows subclassing
-/// (it is sealed), so it can never be found. This resource implements the marker and holds the
-/// external service by reference.
+/// This derives from <see cref="ProjectResource"/> out of necessity, not because it is a project.
+/// Fusion's <c>SchemaComposition.GetProjectPath</c> opens with
+/// <c>if (resource is not ProjectResource) return null;</c>, and every source schema — file-based
+/// <em>and</em> endpoint-based — is resolved through it, because both need a settings JSON read from
+/// the project directory. A resource that merely implements <see cref="IResourceWithEndpoints"/> is
+/// found by the scan and then dropped with "Could not determine project path".
 /// <para>
-/// <see cref="IResourceWithoutLifetime"/> is deliberate: there is nothing to launch, and it keeps
-/// the orchestrator from trying to allocate the endpoint we assign by hand.
+/// <see cref="IResourceWithoutLifetime"/> and a <see cref="ExternalProjectMetadata.SuppressBuild"/>
+/// of <see langword="true"/> are what keep the orchestrator from trying to build or launch the
+/// synthetic project directory this resource points at.
 /// </para>
 /// </remarks>
-public sealed class ExternalGraphQLResource : Resource, IResourceWithEndpoints, IResourceWithoutLifetime
+public sealed class ExternalGraphQLResource : ProjectResource, IResourceWithoutLifetime
 {
-    public ExternalGraphQLResource(string name, ExternalServiceResource service)
+    public ExternalGraphQLResource(string name, ExternalServiceResource service, string projectDirectory)
         : base(name)
-        => Service = service ?? throw new ArgumentNullException(nameof(service));
+    {
+        Service = service ?? throw new ArgumentNullException(nameof(service));
+        ProjectDirectory = projectDirectory ?? throw new ArgumentNullException(nameof(projectDirectory));
+    }
 
     /// <summary>The external service this resource projects.</summary>
     public ExternalServiceResource Service { get; }
+
+    /// <summary>
+    /// Directory the downloaded schema and its settings are written to, and the directory Fusion
+    /// reads them back from.
+    /// </summary>
+    public string ProjectDirectory { get; }
 }

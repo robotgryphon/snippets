@@ -1,4 +1,3 @@
-using System.Net.Sockets;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 
@@ -7,68 +6,87 @@ namespace ExternalGraphQL;
 public static class ExternalGraphQLBuilderExtensions
 {
     private const string DefaultEndpointName = "http";
+    private const string DefaultExternalRoot = "external";
+    private const string SchemaFileName = "schema.graphqls";
 
     /// <summary>
-    /// Adds an <see cref="ExternalGraphQLResource"/> projecting <paramref name="service"/>, with a
-    /// synthesized endpoint resolved from the external service's URI.
+    /// Adds an <see cref="ExternalGraphQLResource"/> projecting <paramref name="service"/>, backed by
+    /// a synthetic project directory at <c>{externalRoot}/{name}/</c>.
     /// </summary>
-    /// <remarks>
-    /// Only a literal <see cref="ExternalServiceResource.Uri"/> is supported. A parameterized URL
-    /// resolves asynchronously and so cannot be allocated while the model is being built; it is
-    /// rejected here rather than racing composition.
-    /// </remarks>
+    /// <param name="externalRoot">
+    /// Root for synthetic project directories, relative to the AppHost directory unless absolute.
+    /// </param>
     public static IResourceBuilder<ExternalGraphQLResource> AddExternalGraphQL(
         this IDistributedApplicationBuilder builder,
         string name,
         IResourceBuilder<ExternalServiceResource> service,
-        string endpointName = DefaultEndpointName)
+        string externalRoot = DefaultExternalRoot)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(service);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
-        var uri = service.Resource.Uri
-            ?? throw new ArgumentException(
-                $"External service '{service.Resource.Name}' has a parameterized URL. Its value is "
-                + "only available asynchronously, so the endpoint cannot be allocated here. Use an "
-                + "external service created from an absolute URI.",
-                nameof(service));
+        var projectDirectory = Path.Combine(
+            Path.IsPathRooted(externalRoot) ? externalRoot : Path.Combine(builder.AppHostDirectory, externalRoot),
+            name);
 
-        var resource = new ExternalGraphQLResource(name, service.Resource);
-
-        var endpoint = new EndpointAnnotation(
-            protocol: ProtocolType.Tcp,
-            uriScheme: uri.Scheme,
-            name: endpointName,
-            port: uri.Port,
-            isExternal: true,
-            isProxied: false);
-
-        // Nothing allocates this endpoint for us — the resource has no lifetime — so assign it
-        // directly. AllocatedEndpoint renders as "{scheme}://{address}:{port}" and has no path
-        // component; see WithGraphQLSourceSchema for how the URI's base path is preserved.
-        endpoint.AllocatedEndpoint = new AllocatedEndpoint(endpoint, uri.Host, uri.Port);
+        var resource = new ExternalGraphQLResource(name, service.Resource, projectDirectory);
 
         return builder.AddResource(resource)
-            .WithAnnotation(endpoint)
-            .WithRelationship(service.Resource, "Reference");
+            // Fusion reads the directory back out of project metadata; the .csproj is never opened.
+            .WithAnnotation(new ExternalProjectMetadata(Path.Combine(projectDirectory, $"{name}.csproj")))
+            .WithRelationship(service.Resource, "Reference")
+            .ExcludeFromManifest();
+    }
+
+    /// <summary>
+    /// Downloads the external service's schema on startup and registers the resource as a
+    /// <see cref="SourceSchemaLocation.ProjectDirectory"/> source schema pointing at it.
+    /// </summary>
+    /// <param name="schemaDownloadPath">
+    /// Path the SDL is fetched from, relative to the external service's URL. Fusion's own fetcher is
+    /// a plain HTTP GET returning schema text, and this matches it.
+    /// </param>
+    /// <param name="graphQLPath">Path the GraphQL endpoint is served from at runtime.</param>
+    /// <param name="sourceSchemaName">
+    /// Source schema name. Defaults to the resource name, and is written into the generated
+    /// settings file, which Fusion requires to agree with this value.
+    /// </param>
+    public static IResourceBuilder<ExternalGraphQLResource> WithDownloadedGraphQLSchema(
+        this IResourceBuilder<ExternalGraphQLResource> builder,
+        string schemaDownloadPath = "/graphql?sdl",
+        string graphQLPath = "/graphql",
+        string? sourceSchemaName = null,
+        string endpointName = DefaultEndpointName)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        var schemaName = sourceSchemaName ?? builder.Resource.Name;
+
+        ExternalGraphQLSchemaDownloader.Subscribe(
+            builder.ApplicationBuilder,
+            builder.Resource,
+            endpointName,
+            schemaDownloadPath,
+            schemaName);
+
+        return builder.WithGraphQLSourceSchema(
+            location: SourceSchemaLocation.ProjectDirectory,
+            // A ProjectDirectory SchemaPath is a file name resolved inside the project directory,
+            // not a URL path.
+            schemaPath: SchemaFileName,
+            graphQLPath: graphQLPath,
+            sourceSchemaName: schemaName,
+            endpointName: endpointName);
     }
 
     /// <summary>
     /// Marks the resource as a Fusion source schema, setting the location explicitly.
     /// </summary>
-    /// <param name="location">
-    /// Where the schema document comes from. Set independently of the endpoint and path values,
-    /// which the public HotChocolate extensions do not permit.
-    /// </param>
-    /// <param name="schemaPath">
-    /// For <see cref="SourceSchemaLocation.SchemaEndpoint"/>, the path the schema is downloaded
-    /// from. For <see cref="SourceSchemaLocation.ProjectDirectory"/>, the schema file name.
-    /// </param>
-    /// <param name="graphQLPath">The path the GraphQL endpoint is served from.</param>
-    /// <param name="sourceSchemaName">
-    /// Source schema name. When omitted, HotChocolate falls back to its own default.
-    /// </param>
+    /// <remarks>
+    /// Prefer <see cref="WithDownloadedGraphQLSchema"/>. This is the lower-level form, for a schema
+    /// already on disk or a deliberate <see cref="SourceSchemaLocation.SchemaEndpoint"/>.
+    /// </remarks>
     public static IResourceBuilder<ExternalGraphQLResource> WithGraphQLSourceSchema(
         this IResourceBuilder<ExternalGraphQLResource> builder,
         SourceSchemaLocation location,
@@ -79,25 +97,24 @@ public static class ExternalGraphQLBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        // The allocated endpoint cannot carry a path, and HotChocolate builds its URL as
-        // endpoint.Url.TrimEnd('/') + path. A base path on the external URI ("https://host/catalog")
-        // would otherwise be dropped, so fold it back in here.
+        // The allocated endpoint carries no path, and Fusion builds URLs as
+        // endpoint.Url.TrimEnd('/') + path, so a base path on the external URI would be dropped.
+        // Only URL-shaped values get it folded back in.
         var basePath = builder.Resource.Service.Uri?.AbsolutePath.TrimEnd('/');
 
         var annotation = GraphQLSourceSchemaAnnotationFactory.Create(
             location: location,
             sourceSchemaName: sourceSchemaName,
             endpointName: endpointName,
-            schemaPath: Combine(basePath, schemaPath, location),
-            graphQLPath: Combine(basePath, graphQLPath, location));
+            schemaPath: location is SourceSchemaLocation.SchemaEndpoint
+                ? Prefix(basePath, schemaPath)
+                : schemaPath,
+            graphQLPath: Prefix(basePath, graphQLPath));
 
         builder.Resource.Annotations.Add(annotation);
         return builder;
     }
 
-    // A ProjectDirectory schemaPath is a file name, not a URL path, so it is never prefixed.
-    private static string? Combine(string? basePath, string? path, SourceSchemaLocation location)
-        => location is SourceSchemaLocation.SchemaEndpoint && !string.IsNullOrEmpty(basePath) && path is not null
-            ? basePath + path
-            : path;
+    private static string? Prefix(string? basePath, string? path)
+        => string.IsNullOrEmpty(basePath) || path is null ? path : basePath + path;
 }

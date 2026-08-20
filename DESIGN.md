@@ -36,26 +36,73 @@ service as a reference**, then carries the source-schema annotation on itself.
 
 ## The resource
 
-`IResourceWithEndpoints` is an empty marker interface — implementing it is free. All the work is in
-producing an endpoint that satisfies HotChocolate's lookup.
+The scan is on `IResourceWithEndpoints`, but that alone is not enough to be *usable*. Fusion resolves
+every source schema's files through `SchemaComposition.GetProjectPath`, which opens with:
 
 ```csharp
-public sealed class ExternalGraphQLResource(string name, ExternalServiceResource service)
-    : Resource(name), IResourceWithEndpoints, IResourceWithoutLifetime
+private string? GetProjectPath(IResourceWithEndpoints resource)
 {
-    public ExternalServiceResource Service { get; } = service;
+    if (resource is not ProjectResource projectResource)
+    {
+        return null;
+    }
+    ...
 }
 ```
 
-`IResourceWithoutLifetime` is load-bearing, not decoration: it marks the resource as a holder of data
-rather than something to launch, which is how we expect to keep DCP from trying to allocate or proxy
-the endpoint we are about to synthesize by hand. See *Risks*.
+A `null` there ends the resource's participation: `ReadSchemaFromProjectDirectoryAsync` logs
+"Could not determine project path" and returns null, and so does `GetSourceSchemaSettingsAsync`. This
+applies to **both** locations — `SchemaEndpoint` also reads a `schema-settings.json` from the project
+directory — so no custom resource can supply a source schema unless it *is* a `ProjectResource`.
+
+`ProjectResource` is not sealed, so the resource derives from it:
+
+```csharp
+public sealed class ExternalGraphQLResource : ProjectResource, IResourceWithoutLifetime
+{
+    public ExternalServiceResource Service { get; }
+    public string ProjectDirectory { get; }
+}
+```
+
+It carries an `IProjectMetadata` annotation whose `ProjectPath` is
+`{externalRoot}/{name}/{name}.csproj`. Fusion only ever takes `Path.GetDirectoryName` of that, so the
+project file never has to exist — but Aspire will otherwise try to build and launch it, hence
+`SuppressBuild => true`, `IResourceWithoutLifetime`, and `ExcludeFromManifest()`. See *Risks*.
 
 A reference, not `IResourceWithParent`. The external service keeps its own identity and its own
 `WithReference` service-discovery behaviour; this resource is a **projection** of it into Fusion's
 world, and more than one can exist per host (`/graphql` and `/admin/graphql` are two source schemas
 behind one URL). A `ResourceRelationshipAnnotation` of type `Reference` gives the dashboard the link
 without claiming ownership.
+
+## Downloading the schema
+
+`ProjectDirectory` is the wanted location because the `SchemaEndpoint` branch populates
+`SourceSchemaInfo` with settings we do not want — `HttpEndpointUrl` and an endpoint configuration
+read through `ReadEndpointConfiguration`. The file branch leaves `HttpEndpointUrl` null and keeps
+`AllocatedHttpEndpointUrl` as the only runtime URL. So the schema is fetched by us and handed to
+Fusion as a file.
+
+A `BeforeStartEvent` subscriber, registered while the model is built, does three things:
+
+1. **Resolves the external URL**, awaiting `UrlParameter` through `IValueProvider` when there is no
+   literal `Uri`. Being in an async handler is what makes parameterized URLs work at all.
+2. **Allocates the endpoint** from the resolved URL. Nothing else will: the resource has no lifetime,
+   so no orchestrator assigns a port, and `GetAllocatedHttpEndpointUrl` returns null without
+   `IsAllocated`.
+3. **Downloads and writes** `{externalRoot}/{name}/schema.graphqls`, plus `schema-settings.json` if
+   absent — Fusion derives that name as `{fileNameWithoutExtension}-settings.json` and requires a
+   non-empty `name` in it that agrees with the annotation's `SourceSchemaName`. An existing settings
+   file is left alone so hand-authored settings survive.
+
+`BeforeStartEvent` is forced, not chosen. Fusion composes from its own `BeforeStartEvent` subscriber,
+and `WaitForSourceSchemaResourcesReadyAsync` skips anything that is not `SchemaEndpoint` — a file
+source is read straight off disk with no wait. The file must therefore exist before Fusion's handler
+runs, which rules out `InitializeResourceEvent` and everything after it. Ordering holds because our
+subscription is registered during model building while Fusion subscribes from
+`IDistributedApplicationEventingSubscriber.SubscribeAsync` at startup, and subscribers are dispatched
+in registration order.
 
 ## What HotChocolate actually reads
 
@@ -164,21 +211,28 @@ public string UriString => $"{UriScheme}://{Address}:{Port}";
 ## Parameterized URLs
 
 When the external service was built from a `ParameterResource`, `Uri` is `null` and the value must be
-read asynchronously, so the endpoint cannot be allocated while building the model. The
-`EndpointAnnotation` is added eagerly (so the resource always looks well-formed to a scan) and
-`AllocatedEndpoint` is assigned during eventing, before composition runs.
+read asynchronously, so nothing about the endpoint can be settled while the model is built. Both the
+`EndpointAnnotation` and its `AllocatedEndpoint` are therefore created in the download hook, once the
+URL has resolved — the same handler, for the same reason, so there is one ordering dependency rather
+than two.
 
-That makes **ordering** the open question: composition must not read the endpoint before we have
-filled it. If our subscriber cannot be guaranteed to run first, `AddExternalGraphQL` should require a
-literal `Uri` in v1 and reject `UrlParameter` with a clear message rather than race.
+The cost is that the resource carries no endpoint annotation until `BeforeStartEvent`. Nothing in
+Fusion looks before then, but any other code that enumerates endpoints during model building will see
+none.
 
 ## Risks
 
-1. **DCP and a hand-allocated endpoint.** The whole design rests on DCP leaving a resource with an
-   `EndpointAnnotation` alone when it has no container, project, or executable to launch.
-   `isProxied: false` plus `IResourceWithoutLifetime` is the intended defence. Unverified — this is
-   the first thing to spike, because if DCP tries to allocate a port, the approach needs rethinking.
-2. **Composition ordering** versus async URL resolution, above.
+1. **A `ProjectResource` that must not be launched.** Deriving from `ProjectResource` is forced by
+   `GetProjectPath`, but it puts the resource in the category Aspire launches. `SuppressBuild`,
+   `IResourceWithoutLifetime`, and `ExcludeFromManifest()` are the intended defence, and whether DCP
+   honours `IResourceWithoutLifetime` on a `ProjectResource` subclass is **unverified**. This is the
+   first thing to spike: if DCP tries to build or run the synthetic directory, the fallback is a
+   launch-suppressing annotation, or upstreaming a `GetProjectPath` that accepts any resource
+   carrying `IProjectMetadata`.
+2. **Subscriber ordering.** Our download must precede Fusion's composition within the same
+   `BeforeStartEvent`. Registration order gives us that today; it is a behavioural dependency, not a
+   contract, and a dispatch that ever went concurrent would break it silently — the symptom would be
+   "Schema file not found" on a cold start and success on the next.
 3. **`Host` header carrying an explicit default port.**
 4. **Internal-type coupling.** Real, and the cost of setting `Location` freely. A HotChocolate
    upgrade that renames the annotation, its properties, or the enum values breaks the factory — by
@@ -188,11 +242,12 @@ literal `Uri` in v1 and reject `UrlParameter` with a clear message rather than r
 
 ## Milestones
 
-- **M0** — spike risk 1 in a throwaway AppHost: does a hand-allocated endpoint on a lifetime-less
-  resource survive startup, and does composition see it?
-- **M1** — `ExternalGraphQLResource`, `AddExternalGraphQL`, literal-`Uri` only, base-path folding.
-  Success is a composed gateway containing a subgraph that is not a project.
-- **M2** — `UrlParameter` support with resolution ordered ahead of composition.
+- **M0** — spike risk 1 in a throwaway AppHost: does a lifetime-less `ProjectResource` subclass
+  survive startup without being built or launched, and does composition see its schema?
+- **M1** — `ExternalGraphQLResource`, `AddExternalGraphQL`, `WithDownloadedGraphQLSchema`. Success is
+  a composed gateway containing a source schema that is not a project.
+- **M2** — recomposition when the external schema changes; today the schema is fetched once at
+  startup.
 - **M3** — dashboard relationship and a GraphQL-aware health probe (`POST { __typename }`; a `GET /`
   on a GraphQL host proves nothing and commonly 404s).
 
