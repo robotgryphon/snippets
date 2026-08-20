@@ -78,45 +78,57 @@ contract we must satisfy is precisely: **an `EndpointAnnotation` whose name matc
 
 ## Attaching the annotation
 
-`GraphQLSourceSchemaAnnotation` is `internal` with `InternalsVisibleTo` only for HotChocolate's own
-tests — but we never need to name it. The method that creates it is public and generic over exactly
-the interface we now implement:
+`GraphQLSourceSchemaAnnotation` is `internal`, with `InternalsVisibleTo` only for HotChocolate's own
+tests:
 
 ```csharp
-[AspireExport]
-public static IResourceBuilder<T> WithGraphQLHttpEndpoint<T>(
-    this IResourceBuilder<T> builder,
-    string path = "/graphql",
-    string? schemaPath = "/graphql/schema.graphql",
-    string endpointName = "http",
-    string? sourceSchemaName = null)
-    where T : IResourceWithEndpoints
+internal sealed class GraphQLSourceSchemaAnnotation : IResourceAnnotation
+{
+    public string? SourceSchemaName { get; init; }
+    public string? EndpointName { get; init; }
+    public string? SchemaPath { get; init; }
+    public string? GraphQLPath { get; init; }
+    public required SourceSchemaLocationType Location { get; init; }
+}
 ```
 
-Verified present in the shipped `HotChocolate.Fusion.Aspire` **16.6.1** for `net9.0`, `net10.0` and
-`net11.0`. The generic constraint is the entire contract, and satisfying it is the whole point of the
-new resource type — so the intended call site is:
+The public extension methods each hardcode `Location`: `WithGraphQLHttpEndpoint` and
+`WithGraphQLSchemaEndpoint` always write `SchemaEndpoint`, and `WithGraphQLSchemaFile` — the only
+route to `ProjectDirectory` — is `[Obsolete]` and exposes neither `GraphQLPath` nor `EndpointName`.
+There is no public way to set `Location` independently of the path and endpoint values, so the
+annotation is constructed by **reflection**.
+
+Two details make this less fragile than it sounds:
+
+- **The assembly is anchored on a public type**, `typeof(GraphQLResourceBuilderExtensions).Assembly`,
+  rather than `Assembly.Load("HotChocolate.Fusion.Aspire")`. That is checked at compile time and
+  cannot fail because the assembly has not been loaded yet.
+- **The enum is mapped by name**, not by ordinal. `SourceSchemaLocationType` is internal too, so
+  values are resolved with `Enum.Parse(locationType, "ProjectDirectory")` — a reordered enum breaks
+  loudly instead of silently changing meaning.
+
+`Location` is `required`, so its implicit constructor carries no `[SetsRequiredMembers]` and
+`Activator.CreateInstance` refuses the type with a `MissingMethodException`. The factory allocates
+with `RuntimeHelpers.GetUninitializedObject` instead, which is safe here: the annotation is a sealed
+class of auto-properties with no field initializers and no constructor logic. `init` accessors are
+ordinary setters carrying a modreq, so `PropertyInfo.SetValue` writes them without complaint.
+
+Only non-null values are written, so a property missing from a given HotChocolate version is never
+touched; `Location` is always set and throws a version-diagnostic message if absent. The annotation
+is added through `IResource.Annotations`, typed as the public `IResourceAnnotation`, so the internal
+type is never named in a signature.
 
 ```csharp
 var catalog = builder.AddExternalService("catalog", "https://catalog.contoso.com");
 
 builder.AddExternalGraphQL("catalog-graphql", catalog)
-       .WithGraphQLHttpEndpoint(path: "/graphql", schemaPath: "/graphql/schema.graphql");
+       .WithGraphQLSourceSchema(
+           location: SourceSchemaLocation.ProjectDirectory,
+           schemaPath: "catalog.graphqls",
+           graphQLPath: "/graphql");
 
 builder.AddProject<Projects.Gateway>("gateway").WithNitroComposition();
 ```
-
-Nothing here is reflection, and nothing depends on an internal type. `WithGraphQLSchemaFile` and
-`WithGraphQLSchemaEndpoint` are also public but both carry `[Obsolete]` — file-based source schemas
-are being retired in favour of fetching from the endpoint.
-
-**Reflection fallback.** Only needed on a version predating `WithGraphQLHttpEndpoint`, or to set a
-field the public method does not expose (there is none today — it covers all five annotation
-properties). If it ever is: resolve the type by name from the `HotChocolate.Fusion.Aspire` assembly,
-construct via `Activator.CreateInstance` with an object initializer through property setters (all
-`init`), and add with `builder.WithAnnotation(...)` typed as `IResourceAnnotation`. Guard it behind a
-single adapter with a version probe so the supported path is used whenever it exists — this is a
-fragile fallback, not the design.
 
 ## Synthesizing the endpoint
 
@@ -168,8 +180,11 @@ literal `Uri` in v1 and reject `UrlParameter` with a clear message rather than r
    the first thing to spike, because if DCP tries to allocate a port, the approach needs rethinking.
 2. **Composition ordering** versus async URL resolution, above.
 3. **`Host` header carrying an explicit default port.**
-4. **Internal-type coupling.** Zero at compile time on the supported path. The coupling that remains
-   is behavioural: we depend on HotChocolate looking up an endpoint *by name* with `IsAllocated`.
+4. **Internal-type coupling.** Real, and the cost of setting `Location` freely. A HotChocolate
+   upgrade that renames the annotation, its properties, or the enum values breaks the factory — by
+   design it fails loudly at startup with a version-naming message rather than silently producing an
+   annotation Fusion ignores. Pin `HotChocolate.Fusion.Aspire` and treat its upgrades as a change
+   that needs a test run.
 
 ## Milestones
 
