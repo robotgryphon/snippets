@@ -1,0 +1,6 @@
+bin/
+obj/
+# Downloaded on every start by WithDownloadedGraphQLSchema.
+external/
+# Composed by the orchestrator.
+*.far

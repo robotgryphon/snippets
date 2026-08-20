@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.5.0" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsAspireHost>true</IsAspireHost>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.5.0" />
+    <PackageReference Include="HotChocolate.Fusion.Aspire" Version="16.6.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The integration itself. Reference the project, or the package once you publish one. -->
+    <ProjectReference Include="../../../src/ExternalGraphQL/ExternalGraphQL.csproj" />
+    <ProjectReference Include="../ExternalGraphQLDemo.Gateway/ExternalGraphQLDemo.Gateway.csproj" />
+  </ItemGroup>
+
+</Project>
