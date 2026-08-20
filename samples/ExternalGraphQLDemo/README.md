@@ -7,8 +7,15 @@ A gateway composing one source schema that is an external service rather than a 
 **1. Reference the integration.** In your AppHost `.csproj`:
 
 ```xml
-<ProjectReference Include="path/to/src/ExternalGraphQL/ExternalGraphQL.csproj" />
+<ProjectReference Include="path/to/src/ExternalGraphQL/ExternalGraphQL.csproj"
+                  IsAspireProjectResource="false" />
 ```
+
+`IsAspireProjectResource="false"` is required, not optional. The AppHost SDK defaults every
+`ProjectReference` to `true`, which generates a `Projects.*` class for it and sets
+`ReferenceOutputAssembly=false`, `ExcludeAssets=all`, and `Private=false` — the assembly is treated as
+a resource to launch and is never referenced as code, so `using ExternalGraphQL;` will not resolve.
+A library has to opt out.
 
 Your AppHost also needs `HotChocolate.Fusion.Aspire` — `ExternalGraphQL` reaches into its internals
 and does not re-export it.

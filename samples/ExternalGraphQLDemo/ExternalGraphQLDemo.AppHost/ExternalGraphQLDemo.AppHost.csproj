@@ -16,8 +16,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The integration itself. Reference the project, or the package once you publish one. -->
-    <ProjectReference Include="../../../src/ExternalGraphQL/ExternalGraphQL.csproj" />
+    <!--
+      The integration itself. IsAspireProjectResource="false" is required: the AppHost SDK defaults
+      every ProjectReference to true, which generates a Projects.* class and sets
+      ReferenceOutputAssembly=false / ExcludeAssets=all, so the assembly is never referenced as code.
+      This is a library, not a resource, so it opts out and is referenced normally.
+    -->
+    <ProjectReference Include="../../../src/ExternalGraphQL/ExternalGraphQL.csproj"
+                      IsAspireProjectResource="false" />
     <ProjectReference Include="../ExternalGraphQLDemo.Gateway/ExternalGraphQLDemo.Gateway.csproj" />
   </ItemGroup>
 
